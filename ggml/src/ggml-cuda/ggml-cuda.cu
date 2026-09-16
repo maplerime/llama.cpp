@@ -721,11 +721,30 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 }
 
 
+// ============ weight-window streaming (prototype) ============
+// Keep large weight buffers in HOST memory instead of VRAM. Before each op runs,
+// copy the weight it needs into a small VRAM scratch and point the op there. So
+// VRAM holds only a window (a few ops' weights) + KV + compute, not all weights.
+// Enable with GGML_CUDA_WSTREAM=1. GGML_CUDA_WSTREAM_MIN sets the min buffer size
+// to stream (default 3 GiB, so only the big weight buffers are host-backed).
+static bool wstream_enabled() {
+    static int e = []{ const char * v = getenv("GGML_CUDA_WSTREAM"); return v ? atoi(v) : 0; }();
+    return e != 0;
+}
+static size_t wstream_threshold() {
+    static size_t t = []{ const char * v = getenv("GGML_CUDA_WSTREAM_MIN");
+                          return v ? (size_t) strtoull(v, nullptr, 10) : (3ull << 30); }();
+    return t;
+}
+static void * wstream_scratch[GGML_MAX_SRC]    = {};
+static size_t wstream_scratch_sz[GGML_MAX_SRC] = {};
+
 // cuda buffer
 
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
+    bool streamed = false;   // host-backed weight buffer (see weight-window streaming)
     std::string name;
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
@@ -734,7 +753,11 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
-        CUDA_CHECK(cudaFree(dev_ptr));
+        if (streamed) {
+            free(dev_ptr);
+        } else {
+            CUDA_CHECK(cudaFree(dev_ptr));
+        }
     }
 };
 
@@ -766,8 +789,12 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
         const size_t padded_size = ggml_backend_buft_get_alloc_size(buffer->buft, tensor);
 
         if (padded_size > original_size) {
-            ggml_cuda_set_device(ctx->device);
-            CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
+            if (ctx->streamed) {
+                memset((char *) tensor->data + original_size, 0, padded_size - original_size);
+            } else {
+                ggml_cuda_set_device(ctx->device);
+                CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
+            }
         }
     }
     return GGML_STATUS_SUCCESS;
@@ -776,6 +803,10 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
+    if (ctx->streamed) {
+        memset((char *) tensor->data + offset, value, size);
+        return;
+    }
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync((char *) tensor->data + offset, value, size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -784,6 +815,10 @@ static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer,
 static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
+    if (ctx->streamed) {
+        memcpy((char *) tensor->data + offset, data, size);   // weights land in host memory
+        return;
+    }
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -792,6 +827,10 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
+    if (ctx->streamed) {
+        memcpy(data, (const char *) tensor->data + offset, size);
+        return;
+    }
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -801,6 +840,12 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
+    if (ctx->streamed) {
+        for (size_t i = 0; i < n_copies; i++) {
+            memcpy((char *) tensor->data + offset + i * stride_tensor, (const char *) data + i * stride_data, size);
+        }
+        return;
+    }
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         (char *) tensor->data + offset, stride_tensor, data, stride_data, size, n_copies, cudaMemcpyHostToDevice, cudaStreamPerThread));
@@ -811,6 +856,12 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
         size_t offset, size_t size, size_t n_copies, size_t stride_tensor, size_t stride_data) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
+    if (ctx->streamed) {
+        for (size_t i = 0; i < n_copies; i++) {
+            memcpy((char *) data + i * stride_data, (const char *) tensor->data + offset + i * stride_tensor, size);
+        }
+        return;
+    }
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpy2DAsync(
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cudaStreamPerThread));
@@ -818,6 +869,14 @@ static void ggml_backend_cuda_buffer_get_tensor_2d(ggml_backend_buffer_t buffer,
 }
 
 static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * src, ggml_tensor * dst) {
+    {   // host-backed weight tensors are not device memory; let the generic path handle it
+        ggml_backend_cuda_buffer_context * sctx = (ggml_backend_cuda_buffer_context *) src->buffer->context;
+        ggml_backend_cuda_buffer_context * dctx = (ggml_backend_cuda_buffer_context *) dst->buffer->context;
+        if ((ggml_backend_buffer_is_cuda(src->buffer) && sctx->streamed) ||
+            (ggml_backend_buffer_is_cuda(dst->buffer) && dctx->streamed)) {
+            return false;
+        }
+    }
     if (ggml_backend_buffer_is_cuda(src->buffer)) {
         ggml_backend_cuda_buffer_context * src_ctx = (ggml_backend_cuda_buffer_context *)src->buffer->context;
         ggml_backend_cuda_buffer_context * dst_ctx = (ggml_backend_cuda_buffer_context *)dst->buffer->context;
@@ -845,6 +904,10 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
 static void ggml_backend_cuda_buffer_clear(ggml_backend_buffer_t buffer, uint8_t value) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *)buffer->context;
 
+    if (ctx->streamed) {
+        memset(ctx->dev_ptr, value, buffer->size);
+        return;
+    }
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemsetAsync(ctx->dev_ptr, value, buffer->size, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
@@ -884,6 +947,19 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
     ggml_backend_cuda_buffer_type_context * buft_ctx = (ggml_backend_cuda_buffer_type_context *)buft->context;
 
     ggml_cuda_set_device(buft_ctx->device);
+
+    // weight-window streaming: back large buffers with HOST memory instead of VRAM
+    if (wstream_enabled() && size >= wstream_threshold()) {
+        void * host_ptr = nullptr;
+        if (posix_memalign(&host_ptr, 4096, size) != 0 || host_ptr == nullptr) {
+            GGML_LOG_ERROR("%s: host alloc of %.2f MiB failed\n", __func__, size / 1024.0 / 1024.0);
+            return nullptr;
+        }
+        GGML_LOG_INFO("%s: WSTREAM host-backing %.2f MiB (stays out of VRAM)\n", __func__, size / 1024.0 / 1024.0);
+        ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, host_ptr);
+        ctx->streamed = true;
+        return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
+    }
 
     void * dev_ptr;
     cudaError_t err = ggml_cuda_device_malloc(&dev_ptr, size, buft_ctx->device);
@@ -2556,6 +2632,10 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+
+    if (wstream_enabled()) {
+        return false;   // weight-window streaming rewrites src pointers per op; no graph replay
+    }
 
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
@@ -4322,7 +4402,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     continue;
                 }
 
-                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+                // weight-window streaming needs each op to go through the single
+                // compute_forward path below (so we can swap its weight pointers)
+                int nodes_to_skip = wstream_enabled() ? 0 : ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
 
                 if (nodes_to_skip != 0) {
 #ifdef GGML_CUDA_DEBUG
@@ -4351,11 +4433,49 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 GGML_UNUSED(integrated);
 #endif  // NDEBUG
 
+                // WSTREAM: pull each host-backed weight src into a VRAM scratch just
+                // before the op, and point the op at it. Copy on the compute stream so
+                // it is ordered before the kernel (and after prior use of the slot).
+                void * wstream_saved[GGML_MAX_SRC] = {};
+                if (wstream_enabled()) {
+                    for (int j = 0; j < GGML_MAX_SRC; j++) {
+                        ggml_tensor * s = node->src[j];
+                        if (!s || !s->buffer || !ggml_backend_buffer_is_cuda(s->buffer)) {
+                            continue;
+                        }
+                        ggml_backend_cuda_buffer_context * sctx = (ggml_backend_cuda_buffer_context *) s->buffer->context;
+                        if (!sctx->streamed) {
+                            continue;
+                        }
+                        size_t nb = s->view_src == nullptr
+                            ? ggml_backend_buft_get_alloc_size(s->buffer->buft, s)
+                            : ggml_nbytes(s);
+                        if (wstream_scratch_sz[j] < nb) {
+                            if (wstream_scratch[j]) {
+                                CUDA_CHECK(cudaFree(wstream_scratch[j]));
+                            }
+                            CUDA_CHECK(cudaMalloc(&wstream_scratch[j], nb));
+                            wstream_scratch_sz[j] = nb;
+                        }
+                        CUDA_CHECK(cudaMemcpyAsync(wstream_scratch[j], s->data, nb, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+                        wstream_saved[j] = s->data;
+                        s->data = wstream_scratch[j];
+                    }
+                }
+
                 bool ok = ggml_cuda_compute_forward(*cuda_ctx, node);
                 if (!ok) {
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+
+                if (wstream_enabled()) {
+                    for (int j = 0; j < GGML_MAX_SRC; j++) {
+                        if (wstream_saved[j]) {
+                            node->src[j]->data = wstream_saved[j];
+                        }
+                    }
+                }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
