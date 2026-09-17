@@ -869,6 +869,10 @@ static size_t                     wstream_produced    = 0;   // jobs the worker 
 static size_t                     wstream_ov_consumed = 0;   // overflow jobs the compute consumed
 static ggml_cgraph *              wstream_cgraph = nullptr;
 static std::thread                wstream_worker_th;
+// cache the read-back expert ids: gate_up and down of a layer share one ids
+// tensor, so we read it (sync + D2H) once per layer, not per op. Reset per graph.
+static const void *               wstream_last_ids = nullptr;
+static std::vector<int32_t>       wstream_hids;
 
 // cuda buffer
 
@@ -4435,6 +4439,10 @@ static void wstream_migrate_rw_buffers(ggml_cgraph * cgraph) {
         wstream_migrated[t->buffer] = { c->dev_ptr, vram };
         c->dev_ptr  = vram;      // new tensors of this buffer get VRAM via get_base
         c->streamed = false;     // stop host-backing / streaming it
+        if (c->server_id) {      // remote: this buffer is now in VRAM, free its server copy
+            wstream_server_free(c->server_id);
+            c->server_id = 0;
+        }
         GGML_LOG_INFO("wstream: RW buffer %.2f MiB moved to VRAM (usage=%d)\n",
                       t->buffer->size / 1048576.0, (int) ggml_backend_buffer_get_usage(t->buffer));
     };
@@ -4572,6 +4580,7 @@ static void wstream_pipe_start(ggml_cgraph * cgraph) {
             if (wstream_is_pipeline_job(cgraph->nodes[i], j)) njobs++;
     wstream_results.assign(njobs, {});
     wstream_produced = 0; wstream_ov_consumed = 0; wstream_cgraph = cgraph;
+    wstream_last_ids = nullptr;   // invalidate the per-graph expert-ids cache
     if (!wstream_copy_stream) CUDA_CHECK(cudaStreamCreate(&wstream_copy_stream));
     if (njobs > 0) wstream_worker_th = std::thread(wstream_worker);
 }
@@ -4599,12 +4608,16 @@ static void * wstream_fetch_experts(ggml_tensor * node, cudaStream_t stream) {
     const size_t expert_bytes = s0->nb[2];         // one expert's matrix
     const size_t full_bytes   = ggml_nbytes(s0);
 
-    // the ids are produced earlier in the graph; make sure they are ready, then read them
-    CUDA_CHECK(cudaStreamSynchronize(stream));
+    // the ids are produced earlier in the graph; make sure they are ready, then read
+    // them. Reuse the read across the layer's two expert matmuls (same ids tensor).
     const int64_t n_ids = ids->ne[0] * ids->ne[1];
-    static std::vector<int32_t> hids;
-    hids.resize(n_ids);
-    CUDA_CHECK(cudaMemcpy(hids.data(), ids->data, n_ids * sizeof(int32_t), cudaMemcpyDeviceToHost));
+    if (ids != wstream_last_ids) {
+        CUDA_CHECK(cudaStreamSynchronize(stream));
+        wstream_hids.resize(n_ids);
+        CUDA_CHECK(cudaMemcpy(wstream_hids.data(), ids->data, n_ids * sizeof(int32_t), cudaMemcpyDeviceToHost));
+        wstream_last_ids = ids;
+    }
+    std::vector<int32_t> & hids = wstream_hids;
 
     int si = wstream_exp_next;
     wstream_exp_next = (wstream_exp_next + 1) % WSTREAM_EXP_SLOTS;
