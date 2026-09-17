@@ -722,11 +722,24 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
 
 
 // ============ weight-window streaming (prototype) ============
-// Keep large weight buffers in HOST memory instead of VRAM. Before each op runs,
-// copy the weight it needs into a small VRAM scratch and point the op there. So
-// VRAM holds only a window (a few ops' weights) + KV + compute, not all weights.
-// Enable with GGML_CUDA_WSTREAM=1. GGML_CUDA_WSTREAM_MIN sets the min buffer size
-// to stream (default 3 GiB, so only the big weight buffers are host-backed).
+// Keep weights out of VRAM. A fixed VRAM cache pins as many weights as fit
+// (GGML_CUDA_WSTREAM_VRAM bytes, filled-then-frozen: the first layers stay
+// resident); weights that do not fit are streamed into a small scratch per op.
+// Weight bytes come from local host memory, or from a remote memserver when
+// GGML_CUDA_WSTREAM_REMOTE=1 (GGML_CUDA_WSTREAM_HOST:PORT, default 127.0.0.1:9797).
+// Enable everything with GGML_CUDA_WSTREAM=1. GGML_CUDA_WSTREAM_MIN is the min
+// buffer size to treat as streamed weights (default 3 GiB).
+#include <unordered_map>
+#include <mutex>
+#include <thread>
+#include <condition_variable>
+#include <cerrno>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
+#include <arpa/inet.h>
+#include <unistd.h>
+
 static bool wstream_enabled() {
     static int e = []{ const char * v = getenv("GGML_CUDA_WSTREAM"); return v ? atoi(v) : 0; }();
     return e != 0;
@@ -736,15 +749,134 @@ static size_t wstream_threshold() {
                           return v ? (size_t) strtoull(v, nullptr, 10) : (3ull << 30); }();
     return t;
 }
-static void * wstream_scratch[GGML_MAX_SRC]    = {};
-static size_t wstream_scratch_sz[GGML_MAX_SRC] = {};
+static bool wstream_remote() {
+    static int e = []{ const char * v = getenv("GGML_CUDA_WSTREAM_REMOTE"); return v ? atoi(v) : 0; }();
+    return e != 0;
+}
+static size_t wstream_vram_cap() {
+    static size_t t = []{ const char * v = getenv("GGML_CUDA_WSTREAM_VRAM");
+                          return v ? (size_t) strtoull(v, nullptr, 10) : (16ull << 30); }();
+    return t;
+}
+
+// ---- tiny client for the memserver (wire format mirrors memhook/proto.h) ----
+#define WSTREAM_MAGIC 0x4d454d48u
+enum { WSTREAM_OP_ALLOC = 1, WSTREAM_OP_FREE = 2, WSTREAM_OP_WRITE = 3, WSTREAM_OP_READ = 4 };
+enum { WSTREAM_FLAG_STREAM = 2 };
+struct wstream_req  { uint32_t magic, op; uint64_t size, id, offset; uint32_t flags, pad; };
+struct wstream_resp { uint32_t magic, status; uint64_t id, size; uint32_t name_len, pad; };
+
+static int        wstream_sock = -1;
+static std::mutex wstream_net_mtx;
+
+static bool wstream_io(int fd, void * buf, size_t n, bool wr) {
+    char * p = (char *) buf;
+    while (n) {
+        ssize_t r = wr ? ::write(fd, p, n) : ::read(fd, p, n);
+        if (r <= 0) { if (r < 0 && errno == EINTR) continue; return false; }
+        p += r; n -= (size_t) r;
+    }
+    return true;
+}
+static bool wstream_connect() {
+    if (wstream_sock >= 0) return true;
+    const char * host = getenv("GGML_CUDA_WSTREAM_HOST"); if (!host) host = "127.0.0.1";
+    const char * ps   = getenv("GGML_CUDA_WSTREAM_PORT"); int port = ps ? atoi(ps) : 9797;
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return false;
+    sockaddr_in a; memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET; a.sin_port = htons((uint16_t) port);
+    if (inet_pton(AF_INET, host, &a.sin_addr) != 1 || connect(fd, (sockaddr *) &a, sizeof(a)) != 0) {
+        GGML_LOG_ERROR("wstream: cannot connect to %s:%d\n", host, port); close(fd); return false;
+    }
+    int one = 1, buf = 16 << 20;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+    wstream_sock = fd;
+    return true;
+}
+static uint64_t wstream_server_alloc(size_t size) {
+    std::lock_guard<std::mutex> lk(wstream_net_mtx);
+    if (!wstream_connect()) return 0;
+    wstream_req q; memset(&q, 0, sizeof(q));
+    q.magic = WSTREAM_MAGIC; q.op = WSTREAM_OP_ALLOC; q.size = size; q.flags = WSTREAM_FLAG_STREAM;
+    wstream_resp r;
+    if (!wstream_io(wstream_sock, &q, sizeof(q), true) || !wstream_io(wstream_sock, &r, sizeof(r), false)
+        || r.magic != WSTREAM_MAGIC || r.status != 0) { close(wstream_sock); wstream_sock = -1; return 0; }
+    return r.id;
+}
+static void wstream_server_write(uint64_t id, uint64_t off, const void * data, size_t n) {
+    std::lock_guard<std::mutex> lk(wstream_net_mtx);
+    if (!wstream_connect()) return;
+    wstream_req q; memset(&q, 0, sizeof(q));
+    q.magic = WSTREAM_MAGIC; q.op = WSTREAM_OP_WRITE; q.id = id; q.offset = off; q.size = n;
+    wstream_resp r;
+    if (!wstream_io(wstream_sock, &q, sizeof(q), true) || !wstream_io(wstream_sock, (void *) data, n, true)
+        || !wstream_io(wstream_sock, &r, sizeof(r), false)) { close(wstream_sock); wstream_sock = -1; }
+}
+static bool wstream_server_read(uint64_t id, uint64_t off, void * dst, size_t n) {
+    std::lock_guard<std::mutex> lk(wstream_net_mtx);
+    if (!wstream_connect()) return false;
+    wstream_req q; memset(&q, 0, sizeof(q));
+    q.magic = WSTREAM_MAGIC; q.op = WSTREAM_OP_READ; q.id = id; q.offset = off; q.size = n;
+    wstream_resp r;
+    if (!wstream_io(wstream_sock, &q, sizeof(q), true) || !wstream_io(wstream_sock, &r, sizeof(r), false)
+        || r.status != 0 || !wstream_io(wstream_sock, dst, n, false)) { close(wstream_sock); wstream_sock = -1; return false; }
+    return true;
+}
+static void wstream_server_free(uint64_t id) {
+    std::lock_guard<std::mutex> lk(wstream_net_mtx);
+    if (wstream_sock < 0) return;
+    wstream_req q; memset(&q, 0, sizeof(q));
+    q.magic = WSTREAM_MAGIC; q.op = WSTREAM_OP_FREE; q.id = id;
+    wstream_resp r;
+    if (!wstream_io(wstream_sock, &q, sizeof(q), true)) { close(wstream_sock); wstream_sock = -1; return; }
+    wstream_io(wstream_sock, &r, sizeof(r), false);
+}
+
+// ---- VRAM cache (pinned resident weights) + per-op streaming scratch ----
+static std::mutex wstream_cache_mtx;
+static void *  wstream_pool       = nullptr;   // one big cudaMalloc, bump-allocated
+static size_t  wstream_pool_cap   = 0;
+static size_t  wstream_pool_used  = 0;
+static std::unordered_map<const void *, void *> wstream_cache;  // host key -> resident VRAM
+// read-write buffers (KV cache, compute) that were host-backed but must live in
+// VRAM: buffer -> (old host base, new vram base)
+static std::unordered_map<ggml_backend_buffer_t, std::pair<void *, void *>> wstream_migrated;
+
+// ---- prefetch pipeline: a background thread fills a ring of slots ahead of
+// compute, overlapping the network fetch + H2D copy with GPU compute. ----
+struct wstream_slot {
+    void *      host = nullptr;   size_t host_cap = 0;   // pinned staging
+    void *      dev  = nullptr;   size_t dev_cap  = 0;   // VRAM buffer
+    cudaEvent_t copy_done = nullptr;   // H2D into dev finished
+    cudaEvent_t consumed  = nullptr;   // kernel that read dev finished
+};
+struct wstream_fetch {
+    void *      dev = nullptr;
+    cudaEvent_t copy_done = nullptr;   // compute waits on this (null if already resident)
+    int         slot = -1;             // ring slot index, or -1 (resident, no reuse)
+    size_t      ov = 0;                // overflow index (valid if slot >= 0)
+};
+#define WSTREAM_NSLOTS 6
+static cudaStream_t               wstream_copy_stream = nullptr;
+static wstream_slot               wstream_slots[WSTREAM_NSLOTS];
+static std::vector<wstream_fetch> wstream_results;
+static std::mutex                 wstream_pipe_mtx;
+static std::condition_variable    wstream_pipe_cv;
+static size_t                     wstream_produced    = 0;   // jobs the worker has produced
+static size_t                     wstream_ov_consumed = 0;   // overflow jobs the compute consumed
+static ggml_cgraph *              wstream_cgraph = nullptr;
+static std::thread                wstream_worker_th;
 
 // cuda buffer
 
 struct ggml_backend_cuda_buffer_context {
     int device;
     void * dev_ptr = nullptr;
-    bool streamed = false;   // host-backed weight buffer (see weight-window streaming)
+    bool streamed = false;    // host-backed weight buffer (see weight-window streaming)
+    uint64_t server_id = 0;   // remote memserver allocation id (streamed + remote)
     std::string name;
 
     ggml_backend_cuda_buffer_context(int device, void * dev_ptr) :
@@ -754,6 +886,7 @@ struct ggml_backend_cuda_buffer_context {
 
     ~ggml_backend_cuda_buffer_context() {
         if (streamed) {
+            if (server_id) wstream_server_free(server_id);
             free(dev_ptr);
         } else {
             CUDA_CHECK(cudaFree(dev_ptr));
@@ -790,7 +923,9 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 
         if (padded_size > original_size) {
             if (ctx->streamed) {
-                memset((char *) tensor->data + original_size, 0, padded_size - original_size);
+                if (!wstream_remote()) {   // remote: server buffer is zero-filled, padding already 0
+                    memset((char *) tensor->data + original_size, 0, padded_size - original_size);
+                }
             } else {
                 ggml_cuda_set_device(ctx->device);
                 CUDA_CHECK(cudaMemset((char *)tensor->data + original_size, 0, padded_size - original_size));
@@ -816,7 +951,12 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     if (ctx->streamed) {
-        memcpy((char *) tensor->data + offset, data, size);   // weights land in host memory
+        if (wstream_remote()) {   // weights go to the remote server, not local memory
+            uint64_t buf_off = ((char *) tensor->data - (char *) ctx->dev_ptr) + offset;
+            wstream_server_write(ctx->server_id, buf_off, data, size);
+        } else {
+            memcpy((char *) tensor->data + offset, data, size);   // weights land in host memory
+        }
         return;
     }
     ggml_cuda_set_device(ctx->device);
@@ -842,7 +982,12 @@ static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer,
 
     if (ctx->streamed) {
         for (size_t i = 0; i < n_copies; i++) {
-            memcpy((char *) tensor->data + offset + i * stride_tensor, (const char *) data + i * stride_data, size);
+            if (wstream_remote()) {
+                uint64_t buf_off = ((char *) tensor->data - (char *) ctx->dev_ptr) + offset + i * stride_tensor;
+                wstream_server_write(ctx->server_id, buf_off, (const char *) data + i * stride_data, size);
+            } else {
+                memcpy((char *) tensor->data + offset + i * stride_tensor, (const char *) data + i * stride_data, size);
+            }
         }
         return;
     }
@@ -955,9 +1100,19 @@ static ggml_backend_buffer_t ggml_backend_cuda_buffer_type_alloc_buffer(ggml_bac
             GGML_LOG_ERROR("%s: host alloc of %.2f MiB failed\n", __func__, size / 1024.0 / 1024.0);
             return nullptr;
         }
-        GGML_LOG_INFO("%s: WSTREAM host-backing %.2f MiB (stays out of VRAM)\n", __func__, size / 1024.0 / 1024.0);
         ggml_backend_cuda_buffer_context * ctx = new ggml_backend_cuda_buffer_context(buft_ctx->device, host_ptr);
         ctx->streamed = true;
+        if (wstream_remote()) {
+            ctx->server_id = wstream_server_alloc(size);
+            if (ctx->server_id == 0) {
+                GGML_LOG_ERROR("%s: WSTREAM remote alloc failed\n", __func__);
+                delete ctx; return nullptr;
+            }
+            GGML_LOG_INFO("%s: WSTREAM %.2f MiB -> remote server (id=%llu)\n",
+                          __func__, size / 1024.0 / 1024.0, (unsigned long long) ctx->server_id);
+        } else {
+            GGML_LOG_INFO("%s: WSTREAM host-backing %.2f MiB (stays out of VRAM)\n", __func__, size / 1024.0 / 1024.0);
+        }
         return ggml_backend_buffer_init(buft, ggml_backend_cuda_buffer_interface, ctx, size);
     }
 
@@ -4262,7 +4417,231 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+// Read-write buffers (KV cache, compute) get host-backed by size at alloc time,
+// but kernels read AND write them, so they must live in VRAM. Before running a
+// graph, move any host-backed non-WEIGHTS buffer to VRAM once and repoint its
+// tensors. Only read-only WEIGHTS buffers stay host/remote-backed and streamed.
+static void wstream_migrate_rw_buffers(ggml_cgraph * cgraph) {
+    std::lock_guard<std::mutex> lk(wstream_cache_mtx);
+
+    auto migrate = [&](ggml_tensor * t) {
+        if (!t || !t->buffer || !ggml_backend_buffer_is_cuda(t->buffer)) return;
+        ggml_backend_cuda_buffer_context * c = (ggml_backend_cuda_buffer_context *) t->buffer->context;
+        if (!c->streamed || ggml_backend_buffer_get_usage(t->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) return;
+        if (wstream_migrated.count(t->buffer)) return;
+        void * vram = nullptr;
+        if (cudaMalloc(&vram, t->buffer->size) != cudaSuccess) { (void) cudaGetLastError(); return; }
+        CUDA_CHECK(cudaMemcpy(vram, c->dev_ptr, t->buffer->size, cudaMemcpyHostToDevice));
+        wstream_migrated[t->buffer] = { c->dev_ptr, vram };
+        c->dev_ptr  = vram;      // new tensors of this buffer get VRAM via get_base
+        c->streamed = false;     // stop host-backing / streaming it
+        GGML_LOG_INFO("wstream: RW buffer %.2f MiB moved to VRAM (usage=%d)\n",
+                      t->buffer->size / 1048576.0, (int) ggml_backend_buffer_get_usage(t->buffer));
+    };
+    auto repoint = [&](ggml_tensor * t) {
+        if (!t || !t->buffer) return;
+        auto it = wstream_migrated.find(t->buffer);
+        if (it == wstream_migrated.end()) return;
+        char * host = (char *) it->second.first;
+        char * vram = (char *) it->second.second;
+        if ((char *) t->data >= host && (char *) t->data < host + t->buffer->size) {
+            t->data = vram + ((char *) t->data - host);
+        }
+    };
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        migrate(cgraph->nodes[i]);
+        for (int j = 0; j < GGML_MAX_SRC; j++) migrate(cgraph->nodes[i]->src[j]);
+    }
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        repoint(cgraph->nodes[i]);
+        for (int j = 0; j < GGML_MAX_SRC; j++) repoint(cgraph->nodes[i]->src[j]);
+    }
+}
+
+static void wstream_slot_ensure(wstream_slot & sl, size_t nb) {
+    if (sl.host_cap < nb) { if (sl.host) cudaFreeHost(sl.host); CUDA_CHECK(cudaMallocHost(&sl.host, nb)); sl.host_cap = nb; }
+    if (sl.dev_cap  < nb) { if (sl.dev)  cudaFree(sl.dev);      CUDA_CHECK(cudaMalloc(&sl.dev, nb));       sl.dev_cap  = nb; }
+    if (!sl.copy_done) CUDA_CHECK(cudaEventCreateWithFlags(&sl.copy_done, cudaEventDisableTiming));
+    if (!sl.consumed)  CUDA_CHECK(cudaEventCreateWithFlags(&sl.consumed,  cudaEventDisableTiming));
+}
+
+// read a weight's bytes (local host buffer, or remote server) into a host buffer
+static void wstream_read_bytes(ggml_backend_cuda_buffer_context * bctx, const void * key, void * dst, size_t nb) {
+    if (wstream_remote()) {
+        uint64_t off = (const char *) key - (const char *) bctx->dev_ptr;
+        if (!wstream_server_read(bctx->server_id, off, dst, nb)) {
+            GGML_LOG_ERROR("wstream: server_read failed off=%llu\n", (unsigned long long) off);
+        }
+    } else {
+        memcpy(dst, key, nb);
+    }
+}
+
+// worker thread: produce the VRAM location for one streamed-weight src.
+// Resident hit -> just the cached pointer. Room in the VRAM cache -> pin resident
+// (one-time). Otherwise -> fill the next ring slot, running ahead of compute.
+static wstream_fetch wstream_produce(ggml_tensor * s, size_t & ov) {
+    ggml_backend_cuda_buffer_context * bctx = (ggml_backend_cuda_buffer_context *) s->buffer->context;
+    const void * key = s->data;
+    const size_t nb  = s->view_src == nullptr
+        ? ggml_backend_buft_get_alloc_size(s->buffer->buft, s) : ggml_nbytes(s);
+
+    auto it = wstream_cache.find(key);
+    if (it != wstream_cache.end()) return { it->second, nullptr, -1, 0 };   // resident hit
+
+    const size_t need = (nb + 255) & ~size_t(255);
+    if (wstream_pool_used + need <= wstream_vram_cap()) {   // pin resident (one-time)
+        void * dst = nullptr;
+        if (cudaMalloc(&dst, nb) == cudaSuccess) {
+            wstream_pool_used += need;
+            void * tmp = nullptr; CUDA_CHECK(cudaMallocHost(&tmp, nb));
+            wstream_read_bytes(bctx, key, tmp, nb);
+            CUDA_CHECK(cudaMemcpyAsync(dst, tmp, nb, cudaMemcpyHostToDevice, wstream_copy_stream));
+            CUDA_CHECK(cudaStreamSynchronize(wstream_copy_stream));   // one-time; frees pinned tmp after
+            cudaFreeHost(tmp);
+            wstream_cache[key] = dst;
+            return { dst, nullptr, -1, 0 };
+        }
+        (void) cudaGetLastError();
+    }
+
+    // overflow: fill a ring slot ahead of compute
+    const int si = (int) (ov % WSTREAM_NSLOTS);
+    wstream_slot & sl = wstream_slots[si];
+    if (ov >= WSTREAM_NSLOTS) {   // backpressure: reuse only after the prev job's kernel is done
+        std::unique_lock<std::mutex> lk(wstream_pipe_mtx);
+        wstream_pipe_cv.wait(lk, [&]{ return wstream_ov_consumed > ov - WSTREAM_NSLOTS; });
+        lk.unlock();
+        CUDA_CHECK(cudaEventSynchronize(sl.consumed));
+    }
+    wstream_slot_ensure(sl, nb);
+    wstream_read_bytes(bctx, key, sl.host, nb);
+    CUDA_CHECK(cudaMemcpyAsync(sl.dev, sl.host, nb, cudaMemcpyHostToDevice, wstream_copy_stream));
+    CUDA_CHECK(cudaEventRecord(sl.copy_done, wstream_copy_stream));
+    wstream_fetch r = { sl.dev, sl.copy_done, si, ov };
+    ov++;
+    return r;
+}
+
+static bool wstream_is_job(ggml_tensor * s) {
+    return s && s->buffer && ggml_backend_buffer_is_cuda(s->buffer) &&
+           ((ggml_backend_cuda_buffer_context *) s->buffer->context)->streamed;
+}
+
+// MoE expert weights (MUL_MAT_ID src[0]) are handled expert-aware (only the
+// active experts), not by the whole-tensor prefetch pipeline.
+static bool wstream_is_expert_src(ggml_tensor * node, int j) {
+    return node->op == GGML_OP_MUL_MAT_ID && j == 0 && wstream_is_job(node->src[0]);
+}
+static bool wstream_is_pipeline_job(ggml_tensor * node, int j) {
+    return wstream_is_job(node->src[j]) && !wstream_is_expert_src(node, j);
+}
+
+static void wstream_worker() {
+    size_t k = 0, ov = 0;
+    for (int i = 0; i < wstream_cgraph->n_nodes; i++) {
+        ggml_tensor * node = wstream_cgraph->nodes[i];
+        for (int j = 0; j < GGML_MAX_SRC; j++) {
+            if (!wstream_is_pipeline_job(node, j)) continue;
+            wstream_fetch r = wstream_produce(node->src[j], ov);
+            { std::lock_guard<std::mutex> lk(wstream_pipe_mtx); wstream_results[k] = r; wstream_produced = k + 1; }
+            wstream_pipe_cv.notify_all();
+            k++;
+        }
+    }
+}
+
+static wstream_fetch wstream_consume(size_t k) {
+    std::unique_lock<std::mutex> lk(wstream_pipe_mtx);
+    wstream_pipe_cv.wait(lk, [&]{ return wstream_produced > k; });
+    return wstream_results[k];
+}
+
+// after a node's kernel is enqueued, free the ring slots it used
+static void wstream_mark_consumed(const wstream_fetch & r, cudaStream_t stream) {
+    if (r.slot < 0) return;
+    CUDA_CHECK(cudaEventRecord(wstream_slots[r.slot].consumed, stream));
+    { std::lock_guard<std::mutex> lk(wstream_pipe_mtx); wstream_ov_consumed = r.ov + 1; }
+    wstream_pipe_cv.notify_all();
+}
+
+static void wstream_pipe_start(ggml_cgraph * cgraph) {
+    size_t njobs = 0;
+    for (int i = 0; i < cgraph->n_nodes; i++)
+        for (int j = 0; j < GGML_MAX_SRC; j++)
+            if (wstream_is_pipeline_job(cgraph->nodes[i], j)) njobs++;
+    wstream_results.assign(njobs, {});
+    wstream_produced = 0; wstream_ov_consumed = 0; wstream_cgraph = cgraph;
+    if (!wstream_copy_stream) CUDA_CHECK(cudaStreamCreate(&wstream_copy_stream));
+    if (njobs > 0) wstream_worker_th = std::thread(wstream_worker);
+}
+
+static void wstream_pipe_finish() {
+    if (wstream_worker_th.joinable()) wstream_worker_th.join();
+}
+
+// ---- MoE expert-aware fetch: bring in only the ACTIVE experts, not all 128 ----
+#define WSTREAM_EXP_SLOTS 3
+static void * wstream_exp_buf[WSTREAM_EXP_SLOTS] = {};
+static size_t wstream_exp_cap[WSTREAM_EXP_SLOTS] = {};
+static int    wstream_exp_next = 0;
+static void * wstream_exp_stage = nullptr;   // pinned host staging (remote)
+static size_t wstream_exp_stage_cap = 0;
+
+// For a MUL_MAT_ID node, read the selected expert ids (src[2]) and copy only
+// those experts' slices of src[0] into a reusable full-size VRAM buffer, at their
+// original positions. The kernel reads only the ids-selected slices, and expert
+// weights are static, so unpopulated positions are never read. Returns the buffer.
+static void * wstream_fetch_experts(ggml_tensor * node, cudaStream_t stream) {
+    ggml_tensor * s0  = node->src[0];   // [ne0, ne1, n_expert] expert weights (streamed)
+    ggml_tensor * ids = node->src[2];   // [n_used, n_tokens] i32
+    ggml_backend_cuda_buffer_context * bctx = (ggml_backend_cuda_buffer_context *) s0->buffer->context;
+    const size_t expert_bytes = s0->nb[2];         // one expert's matrix
+    const size_t full_bytes   = ggml_nbytes(s0);
+
+    // the ids are produced earlier in the graph; make sure they are ready, then read them
+    CUDA_CHECK(cudaStreamSynchronize(stream));
+    const int64_t n_ids = ids->ne[0] * ids->ne[1];
+    static std::vector<int32_t> hids;
+    hids.resize(n_ids);
+    CUDA_CHECK(cudaMemcpy(hids.data(), ids->data, n_ids * sizeof(int32_t), cudaMemcpyDeviceToHost));
+
+    int si = wstream_exp_next;
+    wstream_exp_next = (wstream_exp_next + 1) % WSTREAM_EXP_SLOTS;
+    if (wstream_exp_cap[si] < full_bytes) {
+        if (wstream_exp_buf[si]) cudaFree(wstream_exp_buf[si]);
+        CUDA_CHECK(cudaMalloc(&wstream_exp_buf[si], full_bytes));
+        wstream_exp_cap[si] = full_bytes;
+    }
+    void * B = wstream_exp_buf[si];
+
+    for (int64_t i = 0; i < n_ids; i++) {
+        int e = hids[i];
+        if (e < 0 || (size_t) e >= (size_t) s0->ne[2]) continue;
+        const size_t off = (size_t) e * expert_bytes;
+        if (wstream_remote()) {
+            if (wstream_exp_stage_cap < expert_bytes) {
+                if (wstream_exp_stage) cudaFreeHost(wstream_exp_stage);
+                CUDA_CHECK(cudaMallocHost(&wstream_exp_stage, expert_bytes));
+                wstream_exp_stage_cap = expert_bytes;
+            }
+            uint64_t soff = ((const char *) s0->data - (const char *) bctx->dev_ptr) + off;
+            wstream_server_read(bctx->server_id, soff, wstream_exp_stage, expert_bytes);
+            CUDA_CHECK(cudaMemcpyAsync((char *) B + off, wstream_exp_stage, expert_bytes, cudaMemcpyHostToDevice, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));   // protect shared staging
+        } else {
+            CUDA_CHECK(cudaMemcpyAsync((char *) B + off, (const char *) s0->data + off, expert_bytes, cudaMemcpyHostToDevice, stream));
+        }
+    }
+    return B;
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+    size_t wstream_job = 0;
+    if (wstream_enabled()) {
+        wstream_migrate_rw_buffers(cgraph);   // keep read-write buffers (KV/compute) in VRAM
+        wstream_pipe_start(cgraph);           // spawn the prefetch worker for this graph
+    }
     bool graph_evaluated_or_captured = false;
 
     // flag used to determine whether it is an integrated_gpu
@@ -4298,7 +4677,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (!use_cuda_graph || cuda_graph_update_required) {
             [[maybe_unused]] int prev_i = 0;
 
-            if (stream_ctx.concurrent_events.size() > 0) {
+            if (!wstream_enabled() && stream_ctx.concurrent_events.size() > 0) {
                 should_launch_concurrent_events = true;
                 for (const auto & [tensor, event] : stream_ctx.concurrent_events) {
                     should_launch_concurrent_events = should_launch_concurrent_events && event.is_valid();
@@ -4436,30 +4815,28 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 // WSTREAM: pull each host-backed weight src into a VRAM scratch just
                 // before the op, and point the op at it. Copy on the compute stream so
                 // it is ordered before the kernel (and after prior use of the slot).
-                void * wstream_saved[GGML_MAX_SRC] = {};
+                void *        wstream_saved[GGML_MAX_SRC] = {};
+                wstream_fetch wstream_fetched[GGML_MAX_SRC] = {};
+                bool          wstream_has[GGML_MAX_SRC] = {};
+                void *        wstream_exp_orig = nullptr;   // MoE expert src[0] original ptr
                 if (wstream_enabled()) {
+                    // MoE: fetch only the active experts of a MUL_MAT_ID
+                    if (wstream_is_expert_src(node, 0)) {
+                        wstream_exp_orig = node->src[0]->data;
+                        node->src[0]->data = wstream_fetch_experts(node, cuda_ctx->stream());
+                    }
                     for (int j = 0; j < GGML_MAX_SRC; j++) {
-                        ggml_tensor * s = node->src[j];
-                        if (!s || !s->buffer || !ggml_backend_buffer_is_cuda(s->buffer)) {
+                        if (!wstream_is_pipeline_job(node, j)) {
                             continue;
                         }
-                        ggml_backend_cuda_buffer_context * sctx = (ggml_backend_cuda_buffer_context *) s->buffer->context;
-                        if (!sctx->streamed) {
-                            continue;
+                        wstream_fetch r = wstream_consume(wstream_job++);   // prefetched by the worker
+                        if (r.copy_done) {
+                            CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), r.copy_done, 0));   // GPU waits, no CPU sync
                         }
-                        size_t nb = s->view_src == nullptr
-                            ? ggml_backend_buft_get_alloc_size(s->buffer->buft, s)
-                            : ggml_nbytes(s);
-                        if (wstream_scratch_sz[j] < nb) {
-                            if (wstream_scratch[j]) {
-                                CUDA_CHECK(cudaFree(wstream_scratch[j]));
-                            }
-                            CUDA_CHECK(cudaMalloc(&wstream_scratch[j], nb));
-                            wstream_scratch_sz[j] = nb;
-                        }
-                        CUDA_CHECK(cudaMemcpyAsync(wstream_scratch[j], s->data, nb, cudaMemcpyHostToDevice, cuda_ctx->stream()));
-                        wstream_saved[j] = s->data;
-                        s->data = wstream_scratch[j];
+                        wstream_saved[j] = node->src[j]->data;
+                        node->src[j]->data = r.dev;
+                        wstream_fetched[j] = r;
+                        wstream_has[j] = true;
                     }
                 }
 
@@ -4471,9 +4848,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
 
                 if (wstream_enabled()) {
                     for (int j = 0; j < GGML_MAX_SRC; j++) {
-                        if (wstream_saved[j]) {
+                        if (wstream_has[j]) {
+                            wstream_mark_consumed(wstream_fetched[j], cuda_ctx->stream());   // free the slot after this kernel
                             node->src[j]->data = wstream_saved[j];
                         }
+                    }
+                    if (wstream_exp_orig) {
+                        node->src[0]->data = wstream_exp_orig;
                     }
                 }
 
@@ -4517,6 +4898,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
 #endif  // USE_CUDA_GRAPH
+    }
+
+    if (wstream_enabled()) {
+        wstream_pipe_finish();   // join the prefetch worker for this graph
     }
 }
 
