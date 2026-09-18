@@ -4590,26 +4590,86 @@ static void wstream_pipe_finish() {
 }
 
 // ---- MoE expert-aware fetch: bring in only the ACTIVE experts, not all 128 ----
+// Fallback ring buffers (full-size, no id remap) for prefill / large active sets.
 #define WSTREAM_EXP_SLOTS 3
 static void * wstream_exp_buf[WSTREAM_EXP_SLOTS] = {};
 static size_t wstream_exp_cap[WSTREAM_EXP_SLOTS] = {};
 static int    wstream_exp_next = 0;
 static void * wstream_exp_stage = nullptr;   // pinned host staging (remote)
 static size_t wstream_exp_stage_cap = 0;
+static std::vector<size_t> wstream_exp_dirty[WSTREAM_EXP_SLOTS];  // expert offsets written last use of this slot
+static size_t wstream_exp_dirty_eb[WSTREAM_EXP_SLOTS] = {};       // expert_bytes those slabs were written with
 
-// For a MUL_MAT_ID node, read the selected expert ids (src[2]) and copy only
-// those experts' slices of src[0] into a reusable full-size VRAM buffer, at their
-// original positions. The kernel reads only the ids-selected slices, and expert
-// weights are static, so unpopulated positions are never read. Returns the buffer.
-static void * wstream_fetch_experts(ggml_tensor * node, cudaStream_t stream) {
+// copy one expert's slice (from local host buffer, or remote server) into a
+// device pointer. Shared by the fallback path and the hot-expert cache.
+static void wstream_copy_expert(ggml_tensor * s0, ggml_backend_cuda_buffer_context * bctx,
+                                int e, void * dst, size_t expert_bytes, cudaStream_t stream) {
+    const size_t off = (size_t) e * expert_bytes;
+    if (wstream_remote()) {
+        if (wstream_exp_stage_cap < expert_bytes) {
+            if (wstream_exp_stage) cudaFreeHost(wstream_exp_stage);
+            CUDA_CHECK(cudaMallocHost(&wstream_exp_stage, expert_bytes));
+            wstream_exp_stage_cap = expert_bytes;
+        }
+        uint64_t soff = ((const char *) s0->data - (const char *) bctx->dev_ptr) + off;
+        wstream_server_read(bctx->server_id, soff, wstream_exp_stage, expert_bytes);
+        CUDA_CHECK(cudaMemcpyAsync(dst, wstream_exp_stage, expert_bytes, cudaMemcpyHostToDevice, stream));
+        CUDA_CHECK(cudaStreamSynchronize(stream));   // protect shared staging
+    } else {
+        CUDA_CHECK(cudaMemcpyAsync(dst, (const char *) s0->data + off, expert_bytes, cudaMemcpyHostToDevice, stream));
+    }
+}
+
+// Cross-token hot-expert LRU cache: keep recently-used experts resident in a
+// COMPACT VRAM buffer [ne0, ne1, M] per expert tensor (M < n_expert saves VRAM),
+// and remap the ids to compact slots so the kernel indexes the small buffer.
+// The buffer is zeroed at alloc so never-populated slots are benign zeros: some
+// mul_mat_id kernels (K-quants) read inactive slots, and garbage there faults or
+// NaNs (this is why the earlier remap attempt crashed).
+static int wstream_ecache_slots() {   // M; 0 disables the cache (fallback only)
+    static int m = []{ const char * v = getenv("GGML_CUDA_WSTREAM_ECACHE_M"); return v ? atoi(v) : 0; }();
+    return m;
+}
+static size_t wstream_ecache_budget() {
+    static size_t b = []{ const char * v = getenv("GGML_CUDA_WSTREAM_ECACHE");
+                          return v ? (size_t) strtoull(v, nullptr, 10) : (12ull << 30); }();
+    return b;
+}
+struct wstream_ecache {
+    void *   buf = nullptr;          // VRAM compact [ne0, ne1, M]
+    size_t   expert_bytes = 0;
+    int      M = -1;                 // -1 uninit, 0 disabled (fallback), >0 slots
+    std::vector<int>            slot2exp;   // slot -> expert id (-1 empty)
+    std::unordered_map<int,int> exp2slot;
+    std::vector<uint64_t>       slot_tick;  // last-use tick per slot (LRU)
+    void *   ids_buf = nullptr;      // VRAM i32 remapped ids
+    size_t   ids_cap = 0;
+    uint64_t hits = 0, miss = 0;
+};
+static std::unordered_map<ggml_tensor *, wstream_ecache> wstream_ecache_map;
+static size_t   wstream_ecache_used = 0;
+static uint64_t wstream_ecache_tick = 0;
+
+// state saved so the op's src tensors can be restored after compute
+struct wstream_exp_ctx {
+    bool     active   = false;
+    bool     remapped = false;
+    void *   s0_data  = nullptr;
+    int64_t  s0_ne2   = 0;
+    size_t   s0_nb3   = 0;
+    void *   ids_data = nullptr;
+};
+
+static wstream_exp_ctx wstream_fetch_experts(ggml_tensor * node, cudaStream_t stream) {
+    wstream_exp_ctx c;
     ggml_tensor * s0  = node->src[0];   // [ne0, ne1, n_expert] expert weights (streamed)
     ggml_tensor * ids = node->src[2];   // [n_used, n_tokens] i32
     ggml_backend_cuda_buffer_context * bctx = (ggml_backend_cuda_buffer_context *) s0->buffer->context;
     const size_t expert_bytes = s0->nb[2];         // one expert's matrix
-    const size_t full_bytes   = ggml_nbytes(s0);
+    const size_t full_bytes   = ggml_nbytes(s0);   // all experts
+    const int    n_expert     = (int) s0->ne[2];
 
-    // the ids are produced earlier in the graph; make sure they are ready, then read
-    // them. Reuse the read across the layer's two expert matmuls (same ids tensor).
+    // ids come from the router; ensure ready, then read (reused across the layer's matmuls)
     const int64_t n_ids = ids->ne[0] * ids->ne[1];
     if (ids != wstream_last_ids) {
         CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -4619,34 +4679,81 @@ static void * wstream_fetch_experts(ggml_tensor * node, cudaStream_t stream) {
     }
     std::vector<int32_t> & hids = wstream_hids;
 
+    // unique active experts this op
+    static std::vector<int> uniq; uniq.clear();
+    for (int64_t i = 0; i < n_ids; i++) {
+        int e = hids[i];
+        if (e < 0 || e >= n_expert) continue;
+        bool seen = false;
+        for (int u : uniq) if (u == e) { seen = true; break; }
+        if (!seen) uniq.push_back(e);
+    }
+
+    // lazily set up this tensor's resident cache: one PERSISTENT full-size buffer
+    // per expert tensor. Experts are fetched once and kept resident across tokens.
+    // No id remap and ne[2] is unchanged, so every mul_mat_id kernel path stays
+    // valid (remapping the ids crashes the mmvq/mmq/sorted paths). Inactive slots
+    // hold either the correct expert data (resident) or zeros, never garbage, so
+    // the K-quant kernels that read them stay correct. Costs full_bytes of VRAM per
+    // cached tensor, so cache only tensors that fit the budget; the rest stream.
+    wstream_ecache & ec = wstream_ecache_map[s0];
+    if (ec.M < 0) {
+        if (wstream_ecache_slots() > 0 && wstream_ecache_used + full_bytes <= wstream_ecache_budget() &&
+            cudaMalloc(&ec.buf, full_bytes) == cudaSuccess) {
+            ec.M = 1; ec.expert_bytes = expert_bytes; wstream_ecache_used += full_bytes;
+            CUDA_CHECK(cudaMemsetAsync(ec.buf, 0, full_bytes, stream));   // unfilled slots -> safe zeros
+        } else {
+            (void) cudaGetLastError(); ec.M = 0;   // not cached -> streaming fallback
+        }
+    }
+
+    // resident-cache path: fetch only the active experts not already resident, at
+    // their ORIGINAL positions, and keep them for later tokens.
+    if (ec.M > 0) {
+        for (int e : uniq) {
+            if (ec.exp2slot.count(e)) { ec.hits++; continue; }   // already resident -> no fetch
+            wstream_copy_expert(s0, bctx, e, (char *) ec.buf + (size_t) e * expert_bytes, expert_bytes, stream);
+            ec.exp2slot[e] = 1; ec.miss++;
+        }
+        c.active = true; c.remapped = false; c.s0_data = s0->data;
+        s0->data = ec.buf;
+        return c;
+    }
+
+    // fallback: full-size ring buffer, active experts at their original positions,
+    // inactive slots kept zero (K-quant kernels read them).
     int si = wstream_exp_next;
     wstream_exp_next = (wstream_exp_next + 1) % WSTREAM_EXP_SLOTS;
     if (wstream_exp_cap[si] < full_bytes) {
         if (wstream_exp_buf[si]) cudaFree(wstream_exp_buf[si]);
         CUDA_CHECK(cudaMalloc(&wstream_exp_buf[si], full_bytes));
         wstream_exp_cap[si] = full_bytes;
+        CUDA_CHECK(cudaMemsetAsync(wstream_exp_buf[si], 0, full_bytes, stream));  // all-zero baseline
+        wstream_exp_dirty[si].clear();
     }
     void * B = wstream_exp_buf[si];
-
-    for (int64_t i = 0; i < n_ids; i++) {
-        int e = hids[i];
-        if (e < 0 || (size_t) e >= (size_t) s0->ne[2]) continue;
-        const size_t off = (size_t) e * expert_bytes;
-        if (wstream_remote()) {
-            if (wstream_exp_stage_cap < expert_bytes) {
-                if (wstream_exp_stage) cudaFreeHost(wstream_exp_stage);
-                CUDA_CHECK(cudaMallocHost(&wstream_exp_stage, expert_bytes));
-                wstream_exp_stage_cap = expert_bytes;
-            }
-            uint64_t soff = ((const char *) s0->data - (const char *) bctx->dev_ptr) + off;
-            wstream_server_read(bctx->server_id, soff, wstream_exp_stage, expert_bytes);
-            CUDA_CHECK(cudaMemcpyAsync((char *) B + off, wstream_exp_stage, expert_bytes, cudaMemcpyHostToDevice, stream));
-            CUDA_CHECK(cudaStreamSynchronize(stream));   // protect shared staging
-        } else {
-            CUDA_CHECK(cudaMemcpyAsync((char *) B + off, (const char *) s0->data + off, expert_bytes, cudaMemcpyHostToDevice, stream));
-        }
+    for (size_t off : wstream_exp_dirty[si]) {   // return last use's slabs to zero
+        CUDA_CHECK(cudaMemsetAsync((char *) B + off, 0, wstream_exp_dirty_eb[si], stream));
     }
-    return B;
+    wstream_exp_dirty[si].clear();
+    wstream_exp_dirty_eb[si] = expert_bytes;
+    for (int e : uniq) {
+        wstream_copy_expert(s0, bctx, e, (char *) B + (size_t) e * expert_bytes, expert_bytes, stream);
+        wstream_exp_dirty[si].push_back((size_t) e * expert_bytes);
+    }
+    c.active = true; c.remapped = false; c.s0_data = s0->data;
+    s0->data = B;
+    return c;
+}
+
+static void wstream_restore_experts(ggml_tensor * node, const wstream_exp_ctx & c) {
+    if (!c.active) return;
+    node->src[0]->data = c.s0_data;
+    if (c.remapped) {
+        node->src[0]->ne[2] = c.s0_ne2;
+        node->src[0]->nb[3] = c.s0_nb3;
+        node->src[2]->data  = c.ids_data;
+    }
 }
 
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
@@ -4831,12 +4938,11 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 void *        wstream_saved[GGML_MAX_SRC] = {};
                 wstream_fetch wstream_fetched[GGML_MAX_SRC] = {};
                 bool          wstream_has[GGML_MAX_SRC] = {};
-                void *        wstream_exp_orig = nullptr;   // MoE expert src[0] original ptr
+                wstream_exp_ctx wstream_ec;   // MoE expert-aware fetch state
                 if (wstream_enabled()) {
-                    // MoE: fetch only the active experts of a MUL_MAT_ID
+                    // MoE: fetch only the active experts of a MUL_MAT_ID (hot-expert cache)
                     if (wstream_is_expert_src(node, 0)) {
-                        wstream_exp_orig = node->src[0]->data;
-                        node->src[0]->data = wstream_fetch_experts(node, cuda_ctx->stream());
+                        wstream_ec = wstream_fetch_experts(node, cuda_ctx->stream());
                     }
                     for (int j = 0; j < GGML_MAX_SRC; j++) {
                         if (!wstream_is_pipeline_job(node, j)) {
@@ -4866,9 +4972,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             node->src[j]->data = wstream_saved[j];
                         }
                     }
-                    if (wstream_exp_orig) {
-                        node->src[0]->data = wstream_exp_orig;
-                    }
+                    wstream_restore_experts(node, wstream_ec);
                 }
 
                 if (!is_concurrent_event_active) {
