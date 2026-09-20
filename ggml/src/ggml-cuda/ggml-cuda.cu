@@ -4630,6 +4630,10 @@ static int wstream_ecache_slots() {   // M; 0 disables the cache (fallback only)
     static int m = []{ const char * v = getenv("GGML_CUDA_WSTREAM_ECACHE_M"); return v ? atoi(v) : 0; }();
     return m;
 }
+static int wstream_compact_m() {   // compact remap experiment (decode only); 0 off
+    static int m = []{ const char * v = getenv("GGML_CUDA_WSTREAM_COMPACT_M"); return v ? atoi(v) : 0; }();
+    return m;
+}
 static size_t wstream_ecache_budget() {
     static size_t b = []{ const char * v = getenv("GGML_CUDA_WSTREAM_ECACHE");
                           return v ? (size_t) strtoull(v, nullptr, 10) : (12ull << 30); }();
@@ -4647,8 +4651,57 @@ struct wstream_ecache {
     uint64_t hits = 0, miss = 0;
 };
 static std::unordered_map<ggml_tensor *, wstream_ecache> wstream_ecache_map;
+static std::unordered_map<ggml_tensor *, wstream_ecache> wstream_compact_map;  // compact remap experiment
 static size_t   wstream_ecache_used = 0;
 static uint64_t wstream_ecache_tick = 0;
+static uint64_t wstream_compact_hits = 0, wstream_compact_miss = 0;
+static void wstream_compact_dump() {
+    uint64_t h = wstream_compact_hits, m = wstream_compact_miss;
+    if (h + m == 0) return;
+    fprintf(stderr, "\n=== WSTREAM compact cache: %llu hits, %llu miss -> %.1f%% hit rate ===\n",
+            (unsigned long long) h, (unsigned long long) m, 100.0 * h / (h + m));
+}
+
+// ---- hot-expert usage stats (measurement only, GGML_CUDA_WSTREAM_STATS=1) ----
+// Per expert tensor, count how many ops (layer x token) activated each expert.
+// At exit, report the oracle hit rate of caching the top-M hottest experts per
+// tensor, plus how skewed / how large the working set is. Tells us whether a
+// compact per-expert cache is worth the remap work.
+static bool wstream_stats_on() {
+    static bool on = getenv("GGML_CUDA_WSTREAM_STATS") != nullptr;
+    return on;
+}
+static std::unordered_map<ggml_tensor *, std::vector<uint64_t>> wstream_stat_cnt;
+static void wstream_stats_dump() {
+    if (wstream_stat_cnt.empty()) return;
+    const int Ms[] = {4, 8, 16, 24, 32, 48, 64};
+    uint64_t total = 0;                       // total (op x expert) activations
+    uint64_t cov[7] = {0};                    // activations covered by top-M per tensor
+    double   sum_distinct = 0, sum_ne = 0;    // avg working-set fraction
+    int      n_tensors = 0;
+    for (auto & kv : wstream_stat_cnt) {
+        std::vector<uint64_t> c = kv.second;  // copy to sort
+        uint64_t t = 0; int distinct = 0;
+        for (uint64_t v : c) { t += v; if (v) distinct++; }
+        if (t == 0) continue;
+        n_tensors++; total += t;
+        sum_distinct += distinct; sum_ne += c.size();
+        std::sort(c.begin(), c.end(), std::greater<uint64_t>());
+        for (int mi = 0; mi < 7; mi++) {
+            uint64_t s = 0;
+            for (int i = 0; i < Ms[mi] && i < (int) c.size(); i++) s += c[i];
+            cov[mi] += s;
+        }
+    }
+    if (total == 0) return;
+    fprintf(stderr, "\n=== WSTREAM expert stats: %d tensors, %llu activations ===\n",
+            n_tensors, (unsigned long long) total);
+    fprintf(stderr, "avg distinct experts used per tensor: %.1f / %.0f (%.0f%%)\n",
+            sum_distinct / n_tensors, sum_ne / n_tensors, 100.0 * sum_distinct / sum_ne);
+    fprintf(stderr, "oracle hit rate if caching top-M experts per tensor:\n");
+    for (int mi = 0; mi < 7; mi++)
+        fprintf(stderr, "  M=%-3d -> %.1f%%\n", Ms[mi], 100.0 * cov[mi] / total);
+}
 
 // state saved so the op's src tensors can be restored after compute
 struct wstream_exp_ctx {
@@ -4687,6 +4740,60 @@ static wstream_exp_ctx wstream_fetch_experts(ggml_tensor * node, cudaStream_t st
         bool seen = false;
         for (int u : uniq) if (u == e) { seen = true; break; }
         if (!seen) uniq.push_back(e);
+    }
+
+    if (wstream_stats_on()) {
+        static bool reg = [] { std::atexit(wstream_stats_dump); return true; }();
+        (void) reg;
+        std::vector<uint64_t> & cnt = wstream_stat_cnt[s0];
+        if ((int) cnt.size() != n_expert) cnt.assign(n_expert, 0);
+        for (int e : uniq) cnt[e]++;
+    }
+
+    // ---- compact remap experiment (decode only: single token) ----
+    // Keep only M hottest experts in a COMPACT [ne0, ne1, M] buffer + remap ids to
+    // compact slots. Saves VRAM (M < n_expert) so a small budget covers all layers.
+    // Debug-gated by GGML_CUDA_WSTREAM_COMPACT_M; prefill/multi-token use fallback.
+    if (int cm = wstream_compact_m(); cm > 0 && ids->ne[1] == 1 && (int) uniq.size() <= cm) {
+        wstream_ecache & cc = wstream_compact_map[s0];
+        if (cc.M <= 0) {
+            int want = cm > n_expert ? n_expert : cm;
+            size_t need = (size_t) want * expert_bytes;
+            if (cudaMalloc(&cc.buf, need + expert_bytes) == cudaSuccess) {   // + guard slot
+                cc.M = want; cc.expert_bytes = expert_bytes;
+                cc.slot2exp.assign(want, -1); cc.slot_tick.assign(want, 0);
+                CUDA_CHECK(cudaMemsetAsync(cc.buf, 0, need + expert_bytes, stream));
+            } else { (void) cudaGetLastError(); cc.M = 0; }
+        }
+        if (cc.M > 0) {
+            static bool reg = [] { std::atexit(wstream_compact_dump); return true; }(); (void) reg;
+            for (int e : uniq) {   // hits -> touch MRU
+                auto it = cc.exp2slot.find(e);
+                if (it != cc.exp2slot.end()) { cc.slot_tick[it->second] = ++wstream_ecache_tick; cc.hits++; wstream_compact_hits++; }
+            }
+            for (int e : uniq) {   // misses -> LRU slot
+                if (cc.exp2slot.count(e)) continue;
+                int slot = 0; uint64_t best = UINT64_MAX;
+                for (int s = 0; s < cc.M; s++) if (cc.slot_tick[s] < best) { best = cc.slot_tick[s]; slot = s; }
+                int old = cc.slot2exp[slot];
+                if (old >= 0) cc.exp2slot.erase(old);
+                wstream_copy_expert(s0, bctx, e, (char *) cc.buf + (size_t) slot * expert_bytes, expert_bytes, stream);
+                cc.slot2exp[slot] = e; cc.exp2slot[e] = slot; cc.slot_tick[slot] = ++wstream_ecache_tick; cc.miss++; wstream_compact_miss++;
+            }
+            static std::vector<int32_t> remap; remap.resize(n_ids);
+            for (int64_t i = 0; i < n_ids; i++) {
+                int e = hids[i];
+                remap[i] = (e >= 0 && e < n_expert && cc.exp2slot.count(e)) ? cc.exp2slot[e] : 0;
+            }
+            size_t ib = (size_t) n_ids * sizeof(int32_t);
+            if (cc.ids_cap < ib) { if (cc.ids_buf) cudaFree(cc.ids_buf); CUDA_CHECK(cudaMalloc(&cc.ids_buf, ib)); cc.ids_cap = ib; }
+            CUDA_CHECK(cudaMemcpyAsync(cc.ids_buf, remap.data(), ib, cudaMemcpyHostToDevice, stream));
+            c.active = c.remapped = true;
+            c.s0_data = s0->data; c.s0_ne2 = s0->ne[2]; c.s0_nb3 = s0->nb[3]; c.ids_data = ids->data;
+            s0->data = cc.buf; s0->ne[2] = cc.M; s0->nb[3] = (size_t) cc.M * expert_bytes;
+            ids->data = cc.ids_buf;
+            return c;
+        }
     }
 
     // lazily set up this tensor's resident cache: one PERSISTENT full-size buffer
