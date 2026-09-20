@@ -766,7 +766,6 @@ enum { WSTREAM_FLAG_STREAM = 2 };
 struct wstream_req  { uint32_t magic, op; uint64_t size, id, offset; uint32_t flags, pad; };
 struct wstream_resp { uint32_t magic, status; uint64_t id, size; uint32_t name_len, pad; };
 
-static int        wstream_sock = -1;
 static std::mutex wstream_net_mtx;
 
 static bool wstream_io(int fd, void * buf, size_t n, bool wr) {
@@ -778,61 +777,267 @@ static bool wstream_io(int fd, void * buf, size_t n, bool wr) {
     }
     return true;
 }
-static bool wstream_connect() {
-    if (wstream_sock >= 0) return true;
-    const char * host = getenv("GGML_CUDA_WSTREAM_HOST"); if (!host) host = "127.0.0.1";
-    const char * ps   = getenv("GGML_CUDA_WSTREAM_PORT"); int port = ps ? atoi(ps) : 9797;
+
+// ---- distributed pool: stripe each buffer contiguously across N memserver nodes ----
+// Node list from GGML_CUDA_WSTREAM_NODES="host1:port1,host2:port2,..."; if unset,
+// fall back to the single GGML_CUDA_WSTREAM_HOST/PORT. Each buffer is split into N
+// contiguous parts (part k on node k) so the total pool = sum of the nodes' pools.
+struct wstream_node { std::string host; int port; int sock = -1; };
+static std::vector<wstream_node> wstream_nodes;
+
+static void wstream_nodes_init() {
+    if (!wstream_nodes.empty()) return;
+    const char * list = getenv("GGML_CUDA_WSTREAM_NODES");
+    if (list && *list) {
+        std::string s(list);
+        for (size_t i = 0; i <= s.size(); ) {
+            size_t c = s.find(',', i);
+            std::string tok = s.substr(i, c == std::string::npos ? std::string::npos : c - i);
+            if (!tok.empty()) {
+                size_t colon = tok.find(':');
+                wstream_node n;
+                n.host = colon == std::string::npos ? tok : tok.substr(0, colon);
+                n.port = colon == std::string::npos ? 9797 : atoi(tok.c_str() + colon + 1);
+                wstream_nodes.push_back(n);
+            }
+            if (c == std::string::npos) break;
+            i = c + 1;
+        }
+    }
+    if (wstream_nodes.empty()) {
+        const char * host = getenv("GGML_CUDA_WSTREAM_HOST");
+        const char * ps   = getenv("GGML_CUDA_WSTREAM_PORT");
+        wstream_node n; n.host = host ? host : "127.0.0.1"; n.port = ps ? atoi(ps) : 9797;
+        wstream_nodes.push_back(n);
+    }
+    GGML_LOG_INFO("wstream: %d memserver node(s)\n", (int) wstream_nodes.size());
+}
+static bool wstream_connect_node(int k) {
+    wstream_node & nd = wstream_nodes[k];
+    if (nd.sock >= 0) return true;
     int fd = socket(AF_INET, SOCK_STREAM, 0);
     if (fd < 0) return false;
     sockaddr_in a; memset(&a, 0, sizeof(a));
-    a.sin_family = AF_INET; a.sin_port = htons((uint16_t) port);
-    if (inet_pton(AF_INET, host, &a.sin_addr) != 1 || connect(fd, (sockaddr *) &a, sizeof(a)) != 0) {
-        GGML_LOG_ERROR("wstream: cannot connect to %s:%d\n", host, port); close(fd); return false;
+    a.sin_family = AF_INET; a.sin_port = htons((uint16_t) nd.port);
+    if (inet_pton(AF_INET, nd.host.c_str(), &a.sin_addr) != 1 || connect(fd, (sockaddr *) &a, sizeof(a)) != 0) {
+        GGML_LOG_ERROR("wstream: cannot connect to %s:%d\n", nd.host.c_str(), nd.port); close(fd); return false;
     }
     int one = 1, buf = 16 << 20;
     setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
     setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
     setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
-    wstream_sock = fd;
+    nd.sock = fd;
     return true;
 }
-static uint64_t wstream_server_alloc(size_t size) {
-    std::lock_guard<std::mutex> lk(wstream_net_mtx);
-    if (!wstream_connect()) return 0;
+// open a fresh connection to node k (worker-owned, not the shared per-node socket)
+static int wstream_connect_fresh(int k) {
+    wstream_node & nd = wstream_nodes[k];
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    sockaddr_in a; memset(&a, 0, sizeof(a));
+    a.sin_family = AF_INET; a.sin_port = htons((uint16_t) nd.port);
+    if (inet_pton(AF_INET, nd.host.c_str(), &a.sin_addr) != 1 || connect(fd, (sockaddr *) &a, sizeof(a)) != 0) {
+        close(fd); return -1;
+    }
+    int one = 1, buf = 16 << 20;
+    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
+    setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf, sizeof(buf));
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf, sizeof(buf));
+    return fd;
+}
+static uint64_t wstream_node_alloc(int k, size_t size) {
+    if (!wstream_connect_node(k)) return 0;
+    int fd = wstream_nodes[k].sock;
     wstream_req q; memset(&q, 0, sizeof(q));
     q.magic = WSTREAM_MAGIC; q.op = WSTREAM_OP_ALLOC; q.size = size; q.flags = WSTREAM_FLAG_STREAM;
     wstream_resp r;
-    if (!wstream_io(wstream_sock, &q, sizeof(q), true) || !wstream_io(wstream_sock, &r, sizeof(r), false)
-        || r.magic != WSTREAM_MAGIC || r.status != 0) { close(wstream_sock); wstream_sock = -1; return 0; }
+    if (!wstream_io(fd, &q, sizeof(q), true) || !wstream_io(fd, &r, sizeof(r), false)
+        || r.magic != WSTREAM_MAGIC || r.status != 0) { close(fd); wstream_nodes[k].sock = -1; return 0; }
     return r.id;
 }
-static void wstream_server_write(uint64_t id, uint64_t off, const void * data, size_t n) {
-    std::lock_guard<std::mutex> lk(wstream_net_mtx);
-    if (!wstream_connect()) return;
+static bool wstream_node_rw(int k, int op, uint64_t id, uint64_t off, void * data, size_t n) {
+    if (!wstream_connect_node(k)) return false;
+    int fd = wstream_nodes[k].sock;
     wstream_req q; memset(&q, 0, sizeof(q));
-    q.magic = WSTREAM_MAGIC; q.op = WSTREAM_OP_WRITE; q.id = id; q.offset = off; q.size = n;
+    q.magic = WSTREAM_MAGIC; q.op = op; q.id = id; q.offset = off; q.size = n;
     wstream_resp r;
-    if (!wstream_io(wstream_sock, &q, sizeof(q), true) || !wstream_io(wstream_sock, (void *) data, n, true)
-        || !wstream_io(wstream_sock, &r, sizeof(r), false)) { close(wstream_sock); wstream_sock = -1; }
-}
-static bool wstream_server_read(uint64_t id, uint64_t off, void * dst, size_t n) {
-    std::lock_guard<std::mutex> lk(wstream_net_mtx);
-    if (!wstream_connect()) return false;
-    wstream_req q; memset(&q, 0, sizeof(q));
-    q.magic = WSTREAM_MAGIC; q.op = WSTREAM_OP_READ; q.id = id; q.offset = off; q.size = n;
-    wstream_resp r;
-    if (!wstream_io(wstream_sock, &q, sizeof(q), true) || !wstream_io(wstream_sock, &r, sizeof(r), false)
-        || r.status != 0 || !wstream_io(wstream_sock, dst, n, false)) { close(wstream_sock); wstream_sock = -1; return false; }
+    if (op == WSTREAM_OP_WRITE) {
+        if (!wstream_io(fd, &q, sizeof(q), true) || !wstream_io(fd, data, n, true) || !wstream_io(fd, &r, sizeof(r), false)) {
+            close(fd); wstream_nodes[k].sock = -1; return false; }
+    } else {
+        if (!wstream_io(fd, &q, sizeof(q), true) || !wstream_io(fd, &r, sizeof(r), false)
+            || r.status != 0 || !wstream_io(fd, data, n, false)) { close(fd); wstream_nodes[k].sock = -1; return false; }
+    }
     return true;
 }
-static void wstream_server_free(uint64_t id) {
-    std::lock_guard<std::mutex> lk(wstream_net_mtx);
-    if (wstream_sock < 0) return;
+static void wstream_node_free(int k, uint64_t id) {
+    if (wstream_nodes[k].sock < 0) return;
+    int fd = wstream_nodes[k].sock;
     wstream_req q; memset(&q, 0, sizeof(q));
     q.magic = WSTREAM_MAGIC; q.op = WSTREAM_OP_FREE; q.id = id;
     wstream_resp r;
-    if (!wstream_io(wstream_sock, &q, sizeof(q), true)) { close(wstream_sock); wstream_sock = -1; return; }
-    wstream_io(wstream_sock, &r, sizeof(r), false);
+    if (!wstream_io(fd, &q, sizeof(q), true)) { close(fd); wstream_nodes[k].sock = -1; return; }
+    wstream_io(fd, &r, sizeof(r), false);
+}
+
+// a striped buffer: part k (of db.part bytes) lives on node k as alloc db.ids[k].
+struct wstream_dbuf { size_t size = 0; size_t part = 0; int n = 0; std::vector<uint64_t> ids; };
+static std::vector<wstream_dbuf> wstream_dbufs;   // handle = index + 1
+
+static uint64_t wstream_server_alloc(size_t size) {
+    std::lock_guard<std::mutex> lk(wstream_net_mtx);
+    wstream_nodes_init();
+    int N = (int) wstream_nodes.size();
+    size_t part = (((size + N - 1) / N) + 4095) & ~size_t(4095);   // per-node part, 4 KiB aligned
+    if (part == 0) part = 4096;
+    wstream_dbuf db; db.size = size; db.part = part; db.n = N; db.ids.assign(N, 0);
+    for (int k = 0; k < N; k++) {
+        size_t poff = (size_t) k * part;
+        size_t psz  = poff >= size ? 0 : std::min(part, size - poff);
+        if (psz == 0) continue;                 // small buffer: this node not needed
+        uint64_t id = wstream_node_alloc(k, psz);
+        if (id == 0) { for (int j = 0; j < k; j++) if (db.ids[j]) wstream_node_free(j, db.ids[j]); return 0; }
+        db.ids[k] = id;
+    }
+    wstream_dbufs.push_back(std::move(db));
+    return (uint64_t) wstream_dbufs.size();
+}
+static bool wstream_server_rw(uint64_t handle, uint64_t off, void * data, size_t n, bool wr) {
+    std::lock_guard<std::mutex> lk(wstream_net_mtx);
+    if (handle == 0 || handle > wstream_dbufs.size()) return false;
+    wstream_dbuf & db = wstream_dbufs[handle - 1];
+    char * p = (char *) data;
+    bool ok = true;
+    while (n) {
+        int    k     = (int) (off / db.part);
+        size_t loff  = off % db.part;
+        size_t chunk = std::min(n, db.part - loff);
+        if (k < db.n && db.ids[k]) ok = wstream_node_rw(k, wr ? WSTREAM_OP_WRITE : WSTREAM_OP_READ, db.ids[k], loff, p, chunk) && ok;
+        off += chunk; p += chunk; n -= chunk;
+    }
+    return ok;
+}
+static void wstream_server_write(uint64_t id, uint64_t off, const void * data, size_t n) {
+    wstream_server_rw(id, off, (void *) data, n, true);
+}
+static bool wstream_server_read(uint64_t id, uint64_t off, void * dst, size_t n) {
+    return wstream_server_rw(id, off, dst, n, false);
+}
+static void wstream_server_free(uint64_t id) {
+    std::lock_guard<std::mutex> lk(wstream_net_mtx);
+    if (id == 0 || id > wstream_dbufs.size()) return;
+    wstream_dbuf & db = wstream_dbufs[id - 1];
+    for (int k = 0; k < db.n; k++) if (db.ids[k]) { wstream_node_free(k, db.ids[k]); db.ids[k] = 0; }
+}
+
+// ---- parallel multi-connection expert fetch (aggregate bandwidth) ----
+// A persistent pool of K workers; each owns its own socket per node, a pinned host
+// staging buffer, and a CUDA stream. A batch of expert reads is spread across the
+// workers so several socket transfers run at once (single TCP stream is window/core
+// limited; N streams reach the NIC's real bandwidth). Enable with
+// GGML_CUDA_WSTREAM_CONNS>1; default 1 keeps the serial path.
+static int wstream_conns() {
+    static int k = []{ const char * v = getenv("GGML_CUDA_WSTREAM_CONNS"); return v ? atoi(v) : 1; }();
+    return k < 1 ? 1 : k;
+}
+struct wstream_seg { int node; uint64_t id; uint64_t off; size_t len; };
+struct wstream_job { uint64_t soff; void * dst; };
+struct wstream_ptask { std::vector<wstream_seg> segs; void * dst; size_t bytes; };
+
+// resolve a read [off,len) of a striped buffer into per-node segments (no lock: the
+// dbuf table is only written at load time, read here during compute).
+static void wstream_route(uint64_t handle, uint64_t off, size_t n, std::vector<wstream_seg> & segs) {
+    segs.clear();
+    if (handle == 0 || handle > wstream_dbufs.size()) return;
+    wstream_dbuf & db = wstream_dbufs[handle - 1];
+    while (n) {
+        int    k     = (int) (off / db.part);
+        size_t loff  = off % db.part;
+        size_t chunk = std::min(n, db.part - loff);
+        if (k < db.n && db.ids[k]) segs.push_back({ k, db.ids[k], loff, chunk });
+        off += chunk; n -= chunk;
+    }
+}
+static bool wstream_fd_read(int fd, uint64_t id, uint64_t off, void * dst, size_t n) {
+    wstream_req q; memset(&q, 0, sizeof(q));
+    q.magic = WSTREAM_MAGIC; q.op = WSTREAM_OP_READ; q.id = id; q.offset = off; q.size = n;
+    wstream_resp r;
+    if (!wstream_io(fd, &q, sizeof(q), true) || !wstream_io(fd, &r, sizeof(r), false)
+        || r.status != 0 || !wstream_io(fd, dst, n, false)) return false;
+    return true;
+}
+
+struct wstream_pworker { std::vector<int> sock; char * staging = nullptr; size_t cap = 0; cudaStream_t stream = nullptr; };
+static std::vector<wstream_pworker>  wstream_pw;
+static std::vector<std::thread>      wstream_pw_th;
+static std::vector<wstream_ptask>    wstream_pw_tasks;
+static std::atomic<size_t>           wstream_pw_take{0};
+static std::atomic<size_t>           wstream_pw_done{0};
+static std::atomic<uint64_t>         wstream_pw_gen{0};
+static std::atomic<bool>             wstream_pw_quit{false};
+static std::mutex                    wstream_pw_mtx;
+static std::condition_variable       wstream_pw_cv;
+static int                           wstream_pw_dev = 0;
+
+static void wstream_pw_loop(int wi) {
+    ggml_cuda_set_device(wstream_pw_dev);
+    uint64_t seen = 0;
+    for (;;) {
+        { std::unique_lock<std::mutex> lk(wstream_pw_mtx);
+          wstream_pw_cv.wait(lk, [&]{ return wstream_pw_gen.load() != seen || wstream_pw_quit.load(); }); }
+        if (wstream_pw_quit.load()) return;
+        seen = wstream_pw_gen.load();
+        wstream_pworker & w = wstream_pw[wi];
+        size_t i;
+        while ((i = wstream_pw_take.fetch_add(1)) < wstream_pw_tasks.size()) {
+            wstream_ptask & t = wstream_pw_tasks[i];
+            if (w.cap < t.bytes) { if (w.staging) cudaFreeHost(w.staging); cudaMallocHost((void **) &w.staging, t.bytes); w.cap = t.bytes; }
+            size_t soff = 0; bool ok = true;
+            for (auto & sg : t.segs) {
+                if (w.sock[sg.node] < 0) w.sock[sg.node] = wstream_connect_fresh(sg.node);
+                if (w.sock[sg.node] < 0 || !wstream_fd_read(w.sock[sg.node], sg.id, sg.off, w.staging + soff, sg.len)) {
+                    ok = false; if (w.sock[sg.node] >= 0) { close(w.sock[sg.node]); w.sock[sg.node] = -1; } break;
+                }
+                soff += sg.len;
+            }
+            if (ok) {
+                cudaMemcpyAsync(t.dst, w.staging, t.bytes, cudaMemcpyHostToDevice, w.stream);
+                cudaStreamSynchronize(w.stream);   // staging is reused next task; wait for the copy
+            }
+            wstream_pw_done.fetch_add(1);
+        }
+    }
+}
+static void wstream_pw_init(int device) {
+    if (!wstream_pw.empty()) return;
+    int K = wstream_conns(), N = (int) wstream_nodes.size();
+    wstream_pw_dev = device;
+    ggml_cuda_set_device(device);
+    wstream_pw.resize(K);
+    for (int i = 0; i < K; i++) {
+        wstream_pw[i].sock.assign(N, -1);
+        CUDA_CHECK(cudaStreamCreate(&wstream_pw[i].stream));
+    }
+    for (int i = 0; i < K; i++) wstream_pw_th.emplace_back(wstream_pw_loop, i);
+}
+// fetch a batch of experts (same byte size) from the server into device dst ptrs,
+// spread across K worker connections. Blocks until all are copied to VRAM.
+static void wstream_fetch_parallel(uint64_t handle, const std::vector<wstream_job> & jobs, size_t bytes, int device) {
+    if (jobs.empty()) return;
+    wstream_pw_init(device);
+    wstream_pw_tasks.clear();
+    wstream_pw_tasks.reserve(jobs.size());
+    for (auto & j : jobs) {
+        wstream_ptask t; t.dst = j.dst; t.bytes = bytes;
+        wstream_route(handle, j.soff, bytes, t.segs);
+        wstream_pw_tasks.push_back(std::move(t));
+    }
+    wstream_pw_take.store(0);
+    wstream_pw_done.store(0);
+    { std::lock_guard<std::mutex> lk(wstream_pw_mtx); wstream_pw_gen.fetch_add(1); }
+    wstream_pw_cv.notify_all();
+    while (wstream_pw_done.load() < wstream_pw_tasks.size()) { /* spin; batches are short */ }
+    for (auto & w : wstream_pw) CUDA_CHECK(cudaStreamSynchronize(w.stream));
 }
 
 // ---- VRAM cache (pinned resident weights) + per-op streaming scratch ----
@@ -4771,15 +4976,21 @@ static wstream_exp_ctx wstream_fetch_experts(ggml_tensor * node, cudaStream_t st
                 auto it = cc.exp2slot.find(e);
                 if (it != cc.exp2slot.end()) { cc.slot_tick[it->second] = ++wstream_ecache_tick; cc.hits++; wstream_compact_hits++; }
             }
+            std::vector<wstream_job> mjobs;
+            uint64_t cbase = (uint64_t) ((const char *) s0->data - (const char *) bctx->dev_ptr);
+            bool par = wstream_remote() && wstream_conns() > 1;
             for (int e : uniq) {   // misses -> LRU slot
                 if (cc.exp2slot.count(e)) continue;
                 int slot = 0; uint64_t best = UINT64_MAX;
                 for (int s = 0; s < cc.M; s++) if (cc.slot_tick[s] < best) { best = cc.slot_tick[s]; slot = s; }
                 int old = cc.slot2exp[slot];
                 if (old >= 0) cc.exp2slot.erase(old);
-                wstream_copy_expert(s0, bctx, e, (char *) cc.buf + (size_t) slot * expert_bytes, expert_bytes, stream);
+                void * dst = (char *) cc.buf + (size_t) slot * expert_bytes;
+                if (par) mjobs.push_back({ cbase + (uint64_t) e * expert_bytes, dst });
+                else     wstream_copy_expert(s0, bctx, e, dst, expert_bytes, stream);
                 cc.slot2exp[slot] = e; cc.exp2slot[e] = slot; cc.slot_tick[slot] = ++wstream_ecache_tick; cc.miss++; wstream_compact_miss++;
             }
+            if (!mjobs.empty()) wstream_fetch_parallel(bctx->server_id, mjobs, expert_bytes, bctx->device);
             static std::vector<int32_t> remap; remap.resize(n_ids);
             for (int64_t i = 0; i < n_ids; i++) {
                 int e = hids[i];
@@ -4844,9 +5055,19 @@ static wstream_exp_ctx wstream_fetch_experts(ggml_tensor * node, cudaStream_t st
     }
     wstream_exp_dirty[si].clear();
     wstream_exp_dirty_eb[si] = expert_bytes;
-    for (int e : uniq) {
-        wstream_copy_expert(s0, bctx, e, (char *) B + (size_t) e * expert_bytes, expert_bytes, stream);
-        wstream_exp_dirty[si].push_back((size_t) e * expert_bytes);
+    if (wstream_remote() && wstream_conns() > 1) {
+        std::vector<wstream_job> jobs;
+        uint64_t base = (uint64_t) ((const char *) s0->data - (const char *) bctx->dev_ptr);
+        for (int e : uniq) {
+            jobs.push_back({ base + (uint64_t) e * expert_bytes, (char *) B + (size_t) e * expert_bytes });
+            wstream_exp_dirty[si].push_back((size_t) e * expert_bytes);
+        }
+        wstream_fetch_parallel(bctx->server_id, jobs, expert_bytes, bctx->device);
+    } else {
+        for (int e : uniq) {
+            wstream_copy_expert(s0, bctx, e, (char *) B + (size_t) e * expert_bytes, expert_bytes, stream);
+            wstream_exp_dirty[si].push_back((size_t) e * expert_bytes);
+        }
     }
     c.active = true; c.remapped = false; c.s0_data = s0->data;
     s0->data = B;
